@@ -23,12 +23,10 @@ use isahc::prelude::Configurable;
 use opentelemetry::sdk::export::ExportError;
 use opentelemetry::trace::TraceError;
 use opentelemetry::{
-    global,
-    runtime::Runtime,
-    sdk,
+    global, sdk,
     sdk::export::trace,
     trace::{Event, Link, SpanKind, StatusCode, TracerProvider},
-    Key, KeyValue,
+    Key, KeyValue, Value,
 };
 #[cfg(feature = "collector_client")]
 use opentelemetry_http::HttpClient;
@@ -41,7 +39,6 @@ use uploader::BatchUploader;
 #[cfg(all(
     any(
         feature = "reqwest_collector_client",
-        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ),
     not(feature = "surf_collector_client"),
@@ -66,6 +63,11 @@ pub fn new_pipeline() -> PipelineBuilder {
     PipelineBuilder::default()
 }
 
+/// Guard that uninstalls the Jaeger trace pipeline when dropped
+#[must_use]
+#[derive(Debug)]
+pub struct Uninstall(global::TracerProviderGuard);
+
 /// Jaeger span exporter
 #[derive(Debug)]
 pub struct Exporter {
@@ -82,6 +84,15 @@ pub struct Process {
     pub service_name: String,
     /// Jaeger tags
     pub tags: Vec<KeyValue>,
+}
+
+impl Into<jaeger::Process> for Process {
+    fn into(self) -> jaeger::Process {
+        jaeger::Process::new(
+            self.service_name,
+            Some(self.tags.into_iter().map(Into::into).collect()),
+        )
+    }
 }
 
 #[async_trait]
@@ -127,14 +138,13 @@ pub struct PipelineBuilder {
     client: Option<Box<dyn HttpClient>>,
     export_instrument_library: bool,
     process: Process,
-    max_packet_size: Option<usize>,
     config: Option<sdk::trace::Config>,
 }
 
 impl Default for PipelineBuilder {
     /// Return the default Exporter Builder.
     fn default() -> Self {
-        let builder_defaults = PipelineBuilder {
+        PipelineBuilder {
             agent_endpoint: vec![DEFAULT_AGENT_ENDPOINT.parse().unwrap()],
             #[cfg(any(feature = "collector_client", feature = "wasm_collector_client"))]
             collector_endpoint: None,
@@ -149,16 +159,22 @@ impl Default for PipelineBuilder {
                 service_name: DEFAULT_SERVICE_NAME.to_string(),
                 tags: Vec::new(),
             },
-            max_packet_size: None,
             config: None,
-        };
-
-        // Override above defaults with env vars if set
-        env::assign_attrs(builder_defaults)
+        }
     }
 }
 
 impl PipelineBuilder {
+    /// Assign builder attributes from environment variables.
+    ///
+    /// See the [jaeger variable spec] for full list.
+    ///
+    /// [jaeger variable spec]: https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/sdk-environment-variables.md#jaeger-exporter
+    #[allow(clippy::wrong_self_convention)]
+    pub fn from_env(self) -> Self {
+        env::assign_attrs(self)
+    }
+
     /// Assign the agent endpoint.
     pub fn with_agent_endpoint<T: net::ToSocketAddrs>(self, agent_endpoint: T) -> Self {
         PipelineBuilder {
@@ -238,12 +254,6 @@ impl PipelineBuilder {
         self
     }
 
-    /// Assign the max packet size in bytes. Jaeger defaults is 65000.
-    pub fn with_max_packet_size(mut self, max_packet_size: usize) -> Self {
-        self.max_packet_size = Some(max_packet_size);
-        self
-    }
-
     /// Assign the SDK config for the exporter pipeline.
     pub fn with_trace_config(self, config: sdk::trace::Config) -> Self {
         PipelineBuilder {
@@ -259,46 +269,24 @@ impl PipelineBuilder {
         self
     }
 
-    /// Install a Jaeger pipeline with a simple span processor.
-    pub fn install_simple(self) -> Result<sdk::trace::Tracer, TraceError> {
-        let tracer_provider = self.build_simple()?;
+    /// Install a Jaeger pipeline with the recommended defaults.
+    pub fn install(self) -> Result<(sdk::trace::Tracer, Uninstall), TraceError> {
+        let tracer_provider = self.build()?;
         let tracer =
             tracer_provider.get_tracer("opentelemetry-jaeger", Some(env!("CARGO_PKG_VERSION")));
-        let _ = global::set_tracer_provider(tracer_provider);
-        Ok(tracer)
+
+        let provider_guard = global::set_tracer_provider(tracer_provider);
+
+        Ok((tracer, Uninstall(provider_guard)))
     }
 
-    /// Install a Jaeger pipeline with a batch span processor using the specified runtime.
-    pub fn install_batch<R: Runtime>(self, runtime: R) -> Result<sdk::trace::Tracer, TraceError> {
-        let tracer_provider = self.build_batch(runtime)?;
-        let tracer =
-            tracer_provider.get_tracer("opentelemetry-jaeger", Some(env!("CARGO_PKG_VERSION")));
-        let _ = global::set_tracer_provider(tracer_provider);
-        Ok(tracer)
-    }
-
-    /// Build a configured `sdk::trace::TracerProvider` with a simple span processor.
-    pub fn build_simple(mut self) -> Result<sdk::trace::TracerProvider, TraceError> {
+    /// Build a configured `sdk::trace::TracerProvider` with the recommended defaults.
+    pub fn build(mut self) -> Result<sdk::trace::TracerProvider, TraceError> {
         let config = self.config.take();
         let exporter = self.init_exporter()?;
-        let mut builder = sdk::trace::TracerProvider::builder().with_simple_exporter(exporter);
-        if let Some(config) = config {
-            builder = builder.with_config(config)
-        }
 
-        Ok(builder.build())
-    }
+        let mut builder = sdk::trace::TracerProvider::builder().with_exporter(exporter);
 
-    /// Build a configured `sdk::trace::TracerProvider` with a batch span processor using the
-    /// specified runtime.
-    pub fn build_batch<R: Runtime>(
-        mut self,
-        runtime: R,
-    ) -> Result<sdk::trace::TracerProvider, TraceError> {
-        let config = self.config.take();
-        let exporter = self.init_exporter()?;
-        let mut builder =
-            sdk::trace::TracerProvider::builder().with_default_batch_exporter(exporter, runtime);
         if let Some(config) = config {
             builder = builder.with_config(config)
         }
@@ -322,7 +310,7 @@ impl PipelineBuilder {
 
     #[cfg(not(any(feature = "collector_client", feature = "wasm_collector_client")))]
     fn init_uploader(self) -> Result<(Process, BatchUploader), TraceError> {
-        let agent = AgentAsyncClientUDP::new(self.agent_endpoint.as_slice(), self.max_packet_size)
+        let agent = AgentAsyncClientUDP::new(self.agent_endpoint.as_slice())
             .map_err::<Error, _>(Into::into)?;
         Ok((self.process, BatchUploader::Agent(agent)))
     }
@@ -338,7 +326,6 @@ impl PipelineBuilder {
                 not(feature = "isahc_collector_client"),
                 not(feature = "surf_collector_client"),
                 not(feature = "reqwest_collector_client"),
-                not(feature = "reqwest_rustls_collector_client"),
                 not(feature = "reqwest_blocking_collector_client")
             ))]
             let client = self.client.ok_or(crate::Error::NoHttpClient)?;
@@ -367,16 +354,14 @@ impl PipelineBuilder {
                 not(feature = "surf_collector_client"),
                 any(
                     feature = "reqwest_collector_client",
-                    feature = "reqwest_rustls_collector_client",
                     feature = "reqwest_blocking_collector_client"
                 )
             ))]
             let client = self.client.unwrap_or({
-                #[cfg(any(feature = "reqwest_collector_client", feature = "reqwest_rustls_collector_client"))]
+                #[cfg(feature = "reqwest_collector_client")]
                 let mut builder = reqwest::ClientBuilder::new();
                 #[cfg(all(
                     not(feature = "reqwest_collector_client"),
-                    not(feature = "reqwest_rustls_collector_client"),
                     feature = "reqwest_blocking_collector_client"
                 ))]
                 let mut builder = reqwest::blocking::ClientBuilder::new();
@@ -398,7 +383,6 @@ impl PipelineBuilder {
                 not(feature = "isahc_collector_client"),
                 feature = "surf_collector_client",
                 not(feature = "reqwest_collector_client"),
-                not(feature = "reqwest_rustls_collector_client"),
                 not(feature = "reqwest_blocking_collector_client")
             ))]
             let client = self.client.unwrap_or({
@@ -418,8 +402,7 @@ impl PipelineBuilder {
             Ok((self.process, uploader::BatchUploader::Collector(collector)))
         } else {
             let endpoint = self.agent_endpoint.as_slice();
-            let agent = AgentAsyncClientUDP::new(endpoint, self.max_packet_size)
-                .map_err::<Error, _>(Into::into)?;
+            let agent = AgentAsyncClientUDP::new(endpoint).map_err::<Error, _>(Into::into)?;
             Ok((self.process, BatchUploader::Agent(agent)))
         }
     }
@@ -440,8 +423,7 @@ impl PipelineBuilder {
             Ok((self.process, uploader::BatchUploader::Collector(collector)))
         } else {
             let endpoint = self.agent_endpoint.as_slice();
-            let agent = AgentAsyncClientUDP::new(endpoint, self.max_packet_size)
-                .map_err::<Error, _>(Into::into)?;
+            let agent = AgentAsyncClientUDP::new(endpoint).map_err::<Error, _>(Into::into)?;
             Ok((self.process, BatchUploader::Agent(agent)))
         }
     }
@@ -462,6 +444,48 @@ impl surf::middleware::Middleware for BasicAuthMiddleware {
     ) -> surf::Result<surf::Response> {
         req.insert_header(self.0.name(), self.0.value());
         next.run(req, client).await
+    }
+}
+
+#[rustfmt::skip]
+impl Into<jaeger::Tag> for KeyValue {
+    fn into(self) -> jaeger::Tag {
+        let KeyValue { key, value } = self;
+        match value {
+            Value::String(s) => jaeger::Tag::new(key.into(), jaeger::TagType::String, Some(s.into()), None, None, None, None),
+            Value::F64(f) => jaeger::Tag::new(key.into(), jaeger::TagType::Double, None, Some(f.into()), None, None, None),
+            Value::Bool(b) => jaeger::Tag::new(key.into(), jaeger::TagType::Bool, None, None, Some(b), None, None),
+            Value::I64(i) => jaeger::Tag::new(key.into(), jaeger::TagType::Long, None, None, None, Some(i), None),
+            // TODO: better Array handling, jaeger thrift doesn't support arrays
+            v @ Value::Array(_) => jaeger::Tag::new(key.into(), jaeger::TagType::String, Some(v.to_string()), None, None, None, None),
+        }
+    }
+}
+
+impl Into<jaeger::Log> for Event {
+    fn into(self) -> jaeger::Log {
+        let timestamp = self
+            .timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_micros() as i64;
+        let mut event_set_via_attribute = false;
+        let mut fields = self
+            .attributes
+            .into_iter()
+            .map(|attr| {
+                if attr.key.as_str() == "event" {
+                    event_set_via_attribute = true;
+                };
+                attr.into()
+            })
+            .collect::<Vec<_>>();
+
+        if !event_set_via_attribute {
+            fields.push(Key::new("event").string(self.name).into());
+        }
+
+        jaeger::Log::new(timestamp, fields)
     }
 }
 
@@ -581,8 +605,8 @@ fn build_span_tags(
     }
 
     if status_code != StatusCode::Unset {
-        // Ensure error status is set unless user has already overrided it
-        if status_code == StatusCode::Error || !user_overrides.error {
+        // Ensure error status is set
+        if status_code == StatusCode::Error {
             tags.push(Key::new(ERROR).bool(true).into());
         }
         tags.push(
@@ -655,16 +679,15 @@ pub enum Error {
     #[cfg(feature = "collector_client")]
     #[error(
         "No http client provided. Consider enable one of the `surf_collector_client`, \
-        `reqwest_collector_client`, `reqwest_rustls_collector_client`, `reqwest_blocking_collector_client`,
-        `isahc_collector_client` feature to have a default implementation. Or use with_http_client method in pipeline \
-        to provide your own implementation."
+        `reqwest_collector_client`, `reqwest_blocking_collector_client`, `isahc_collector_client` \
+        feature to have a default implementation. Or use with_http_client method in pipeline to \
+        provide your own implementation."
     )]
     NoHttpClient,
     /// reqwest client errors
     #[error("reqwest failed with {0}")]
     #[cfg(any(
         feature = "reqwest_collector_client",
-        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ))]
     ReqwestClientError(#[from] reqwest::Error),
@@ -736,7 +759,6 @@ mod collector_client_tests {
         feature = "isahc_collector_client",
         feature = "surf_collector_client",
         feature = "reqwest_collector_client",
-        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ))]
     fn test_set_collector_endpoint() {
@@ -811,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_status() {
+    fn test_set_status() -> Result<(), Box<dyn std::error::Error>> {
         for (status_code, error_msg, status_tag_val, msg_tag_val) in get_error_tag_test_data() {
             let tags = build_span_tags(
                 EvictedHashMap::new(20, 20),
@@ -832,5 +854,6 @@ mod tests {
                 assert_tag_not_contains(tags.clone(), OTEL_STATUS_DESCRIPTION);
             }
         }
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 ![OpenTelemetry — An observability framework for cloud-native software.][splash]
 
-[splash]: https://raw.githubusercontent.com/open-telemetry/opentelemetry-rust/main/assets/logo-text.png
+[splash]: https://raw.githubusercontent.com/open-telemetry/opentelemetry-rust/master/assets/logo-text.png
 
 # OpenTelemetry Jaeger
 
@@ -9,7 +9,7 @@
 [![Crates.io: opentelemetry-jaeger](https://img.shields.io/crates/v/opentelemetry-jaeger.svg)](https://crates.io/crates/opentelemetry-jaeger)
 [![Documentation](https://docs.rs/opentelemetry-jaeger/badge.svg)](https://docs.rs/opentelemetry-jaeger)
 [![LICENSE](https://img.shields.io/crates/l/opentelemetry-jaeger)](./LICENSE)
-[![GitHub Actions CI](https://github.com/open-telemetry/opentelemetry-rust/workflows/CI/badge.svg)](https://github.com/open-telemetry/opentelemetry-rust/actions?query=workflow%3ACI+branch%3Amain)
+[![GitHub Actions CI](https://github.com/open-telemetry/opentelemetry-rust/workflows/CI/badge.svg)](https://github.com/open-telemetry/opentelemetry-rust/actions?query=workflow%3ACI+branch%3Amaster)
 [![Gitter chat](https://img.shields.io/badge/gitter-join%20chat%20%E2%86%92-brightgreen.svg)](https://gitter.im/open-telemetry/opentelemetry-rust)
 
 [Documentation](https://docs.rs/opentelemetry-jaeger) |
@@ -42,55 +42,64 @@ Then install a new jaeger pipeline with the recommended defaults to start
 exporting telemetry:
 
 ```rust
+use opentelemetry::tracer;
 use opentelemetry::global;
-use opentelemetry::trace::Tracer;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-    let tracer = opentelemetry_jaeger::new_pipeline().install_simple()?;
+    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline().install()?;
 
     tracer.in_span("doing_work", |cx| {
         // Traced app logic here...
     });
 
-    global::shut_down_provider(); // sending remaining spans
-
     Ok(())
 }
 ```
 
-![Jaeger UI](https://raw.githubusercontent.com/open-telemetry/opentelemetry-rust/main/opentelemetry-jaeger/trace.png)
+![Jaeger UI](https://raw.githubusercontent.com/open-telemetry/opentelemetry-rust/master/opentelemetry-jaeger/trace.png)
 
 ## Performance
 
 For optimal performance, a batch exporter is recommended as the simple exporter
-will export each span synchronously on drop. You can enable the [`rt-tokio`],
-[`rt-tokio-current-thread`] or [`rt-async-std`] features and specify a runtime
-on the pipeline builder to have a batch exporter configured for you
-automatically.
+will export each span synchronously on drop. You can enable the [`tokio-support`] or
+[`async-std`] features to have a batch exporter configured for you automatically
+for either executor when you install the pipeline.
 
 ```toml
 [dependencies]
-opentelemetry = { version = "*", features = ["rt-tokio"] }
+opentelemetry = { version = "*", features = ["tokio-support"] }
 opentelemetry-jaeger = { version = "*", features = ["tokio"] }
 ```
 
-```rust
-let tracer = opentelemetry_jaeger::new_pipeline()
-    .install_batch(opentelemetry::runtime::Tokio)?;
-```
-
-[`rt-tokio`]: https://tokio.rs
-[`rt-tokio-current-thread`]: https://tokio.rs
-[`rt-async-std`]: https://async.rs
+[`tokio-support`]: https://tokio.rs
+[`async-std`]: https://async.rs
 
 ### Jaeger Exporter From Environment Variables
 
-The jaeger pipeline builder can be configured dynamically via environment
-variables. All variables are optional, a full list of accepted options can be
-found in the [jaeger variables spec].
+The jaeger pipeline builder can be configured dynamically via the [`from_env`]
+method. All variables are optional, a full list of accepted options can be found
+in the [jaeger variables spec].
 
+[`from_env`]: https://docs.rs/opentelemetry-jaeger/latest/opentelemetry_jaeger/struct.PipelineBuilder.html#method.from_env
 [jaeger variables spec]: https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/sdk-environment-variables.md#jaeger-exporter
+
+```rust
+use opentelemetry::tracer;
+use opentelemetry::global;
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
+    // export OTEL_SERVICE_NAME=my-service-name
+    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline().from_env().install()?;
+
+    tracer.in_span("doing_work", |cx| {
+        // Traced app logic here...
+    });
+
+    Ok(())
+}
+```
 
 ### Jaeger Collector Example
 
@@ -117,21 +126,19 @@ Then you can use the [`with_collector_endpoint`] method to specify the endpoint:
 // You can also provide your own implementation by enable
 // `collecor_client` and set it with
 // new_pipeline().with_http_client() method.
-use opentelemetry::trace::Tracer;
+use opentelemetry::tracer;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let tracer = opentelemetry_jaeger::new_pipeline()
+    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline()
         .with_collector_endpoint("http://localhost:14268/api/traces")
         // optionally set username and password as well.
         .with_collector_username("username")
         .with_collector_password("s3cr3t")
-        .install_simple()?;
+        .install()?;
 
     tracer.in_span("doing_work", |cx| {
         // Traced app logic here...
     });
-
-    opentelemetry::global::shut_down_provider(); // sending remaining spans
 
     Ok(())
 }
@@ -145,37 +152,32 @@ Example showing how to override all configuration options. See the
 [`PipelineBuilder`]: https://docs.rs/opentelemetry-jaeger/latest/opentelemetry_jaeger/struct.PipelineBuilder.html
 
 ```rust
+use opentelemetry::{KeyValue, Tracer};
+use opentelemetry::sdk::{trace, IdGenerator, Resource, Sampler};
 use opentelemetry::global;
-use opentelemetry::sdk::{
-    trace::{self, IdGenerator, Sampler},
-    Resource,
-};
-use opentelemetry::trace::Tracer;
-use opentelemetry::KeyValue;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     global::set_text_map_propagator(opentelemetry_jaeger::Propagator::new());
-    let tracer = opentelemetry_jaeger::new_pipeline()
+    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline()
+        .from_env()
         .with_agent_endpoint("localhost:6831")
         .with_service_name("my_app")
         .with_tags(vec![KeyValue::new("process_key", "process_value")])
-        .with_max_packet_size(9_216)
+        .with_max_packet_size(65_000)
         .with_trace_config(
             trace::config()
-                .with_sampler(Sampler::AlwaysOn)
+                .with_default_sampler(Sampler::AlwaysOn)
                 .with_id_generator(IdGenerator::default())
                 .with_max_events_per_span(64)
                 .with_max_attributes_per_span(16)
                 .with_max_events_per_span(16)
                 .with_resource(Resource::new(vec![KeyValue::new("key", "value")])),
         )
-        .install_batch(opentelemetry::runtime::Tokio)?;
+        .install()?;
 
     tracer.in_span("doing_work", |cx| {
         // Traced app logic here...
     });
-
-    global::shut_down_provider(); // sending remaining spans
 
     Ok(())
 }
