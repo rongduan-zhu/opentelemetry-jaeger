@@ -41,6 +41,7 @@ use uploader::BatchUploader;
 #[cfg(all(
     any(
         feature = "reqwest_collector_client",
+        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ),
     not(feature = "surf_collector_client"),
@@ -337,6 +338,7 @@ impl PipelineBuilder {
                 not(feature = "isahc_collector_client"),
                 not(feature = "surf_collector_client"),
                 not(feature = "reqwest_collector_client"),
+                not(feature = "reqwest_rustls_collector_client"),
                 not(feature = "reqwest_blocking_collector_client")
             ))]
             let client = self.client.ok_or(crate::Error::NoHttpClient)?;
@@ -365,14 +367,16 @@ impl PipelineBuilder {
                 not(feature = "surf_collector_client"),
                 any(
                     feature = "reqwest_collector_client",
+                    feature = "reqwest_rustls_collector_client",
                     feature = "reqwest_blocking_collector_client"
                 )
             ))]
             let client = self.client.unwrap_or({
-                #[cfg(feature = "reqwest_collector_client")]
+                #[cfg(any(feature = "reqwest_collector_client", feature = "reqwest_rustls_collector_client"))]
                 let mut builder = reqwest::ClientBuilder::new();
                 #[cfg(all(
                     not(feature = "reqwest_collector_client"),
+                    not(feature = "reqwest_rustls_collector_client"),
                     feature = "reqwest_blocking_collector_client"
                 ))]
                 let mut builder = reqwest::blocking::ClientBuilder::new();
@@ -394,6 +398,7 @@ impl PipelineBuilder {
                 not(feature = "isahc_collector_client"),
                 feature = "surf_collector_client",
                 not(feature = "reqwest_collector_client"),
+                not(feature = "reqwest_rustls_collector_client"),
                 not(feature = "reqwest_blocking_collector_client")
             ))]
             let client = self.client.unwrap_or({
@@ -650,15 +655,16 @@ pub enum Error {
     #[cfg(feature = "collector_client")]
     #[error(
         "No http client provided. Consider enable one of the `surf_collector_client`, \
-        `reqwest_collector_client`, `reqwest_blocking_collector_client`, `isahc_collector_client` \
-        feature to have a default implementation. Or use with_http_client method in pipeline to \
-        provide your own implementation."
+        `reqwest_collector_client`, `reqwest_rustls_collector_client`, `reqwest_blocking_collector_client`,
+        `isahc_collector_client` feature to have a default implementation. Or use with_http_client method in pipeline \
+        to provide your own implementation."
     )]
     NoHttpClient,
     /// reqwest client errors
     #[error("reqwest failed with {0}")]
     #[cfg(any(
         feature = "reqwest_collector_client",
+        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ))]
     ReqwestClientError(#[from] reqwest::Error),
@@ -730,6 +736,7 @@ mod collector_client_tests {
         feature = "isahc_collector_client",
         feature = "surf_collector_client",
         feature = "reqwest_collector_client",
+        feature = "reqwest_rustls_collector_client",
         feature = "reqwest_blocking_collector_client"
     ))]
     fn test_set_collector_endpoint() {
